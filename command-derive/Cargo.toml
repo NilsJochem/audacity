@@ -14,4 +14,4 @@ quote = "1.0"
 darling = "0.20"
 syn = { version = "2.0", features = ["full"] }
 momo = "0.2"
-common = { git = "https://github.com/NilsJochem/rust-common" }
+common = { git = "ssh://git@github.com/NilsJochem/rust-common" }
