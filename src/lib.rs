@@ -15,6 +15,8 @@ use tokio::{
     time::{error::Elapsed, interval, timeout},
 };
 
+use common::extensions::duration::Ext;
+
 pub mod command;
 
 #[cfg(windows)]
@@ -165,31 +167,104 @@ impl LaunchError {
     }
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub program: String,
     // TODO maybe change to list of args
-    pub arg: Option<String>,
+    #[serde(default = "Vec::new")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub arg: Vec<String>,
     /// the length of time until the process is assumed to not be a launcher. The Programm will no longer wait for an exit code.
-    #[serde(default = "Config::default_timeout")]
-    #[serde(skip_serializing_if = "Config::is_default_timeout")]
+    #[serde(
+        default = "Config::default_timeout",
+        skip_serializing_if = "Config::is_default_timeout",
+        deserialize_with = "from_millis",
+        serialize_with = "as_millis"
+    )]
     pub timeout: Duration,
+    #[serde(
+        default = "Config::default_hide",
+        skip_serializing_if = "Config::is_default_hide"
+    )]
+    pub hide_output: bool,
 }
+
+fn as_millis<S>(d: &Duration, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    ser.serialize_u64(d.as_millis() as u64)
+}
+fn from_millis<'de, D>(ser: D) -> Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    ser.deserialize_u64(DurationVisitor)
+}
+struct DurationVisitor;
+impl<'de> serde::de::Visitor<'de> for DurationVisitor {
+    type Value = Duration;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("the duration in milliseconds")
+    }
+    fn visit_u8<E>(self, v: u8) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_u64(v as u64)
+    }
+    fn visit_u16<E>(self, v: u16) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_u64(v as u64)
+    }
+    fn visit_u32<E>(self, v: u32) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_u64(v as u64)
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        u64::try_from(v)
+            .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &"only positiv values"))
+            .and_then(|v| self.visit_u64(v))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Duration::from_millis(v))
+    }
+}
+
 impl Config {
     const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
     const fn default_timeout() -> Duration {
         Self::DEFAULT_TIMEOUT
     }
     fn is_default_timeout(it: &Duration) -> bool {
-        is_near_to(*it, Self::DEFAULT_TIMEOUT, Duration::from_millis(1))
+        (*it).is_near_to(Self::default_timeout(), Duration::from_millis(1))
+    }
+
+    const fn default_hide() -> bool {
+        false
+    }
+    fn is_default_hide(it: &bool) -> bool {
+        *it == Self::default_hide()
     }
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             program: "gtk4-launch".to_owned(),
-            arg: Some("audacity".to_owned()),
+            arg: vec!["audacity".to_owned()],
             timeout: Self::default_timeout(),
+            hide_output: Self::default_hide(),
         }
     }
 }
@@ -258,7 +333,10 @@ impl AudacityApi {
             .unwrap_or_else(|| Self::load_config().unwrap());
         let mut future = Box::pin(async move {
             let mut command = tokio::process::Command::new(config.program);
-            if let Some(arg) = config.arg {
+            if config.hide_output {
+                command.stdout(std::process::Stdio::null());
+            }
+            for arg in &config.arg {
                 command.arg(arg);
             }
             command.kill_on_drop(true);
@@ -707,8 +785,12 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
 
         let predicate = |(_, candidate): &(usize, &TimeLabel)| {
             candidate.name.is_none()
-                && is_near_to(candidate.start, label.start, Duration::from_millis(50))
-                && is_near_to(candidate.end, label.end, Duration::from_millis(50))
+                && candidate
+                    .start
+                    .is_near_to(label.start, Duration::from_millis(50))
+                && candidate
+                    .end
+                    .is_near_to(label.end, Duration::from_millis(50))
         };
         let new_id = match hint {
             Some(LabelHint::LabelNr(nr)) => nr,
@@ -806,11 +888,6 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     ) -> Result<(), Error> {
         self.write_assume_empty(selection.into().into()).await
     }
-}
-
-#[inline]
-fn is_near_to(a: Duration, b: Duration, delta: Duration) -> bool {
-    (if a >= b { a - b } else { b - a }) < delta
 }
 
 /// reads the next line from `read_pipe` and removes "\r?\n" from the end
@@ -1083,5 +1160,38 @@ mod tests {
             api.read(false).await.unwrap_err(),
             Error::AudacityErr(e) if e==msg
         ));
+    }
+
+    mod config {
+        use std::time::Duration;
+
+        use crate::Config;
+
+        #[test]
+        fn read() {
+            let conf = confy::load_path("res/config.toml").unwrap();
+            assert_eq!(
+                Config {
+                    program: "program".to_owned(),
+                    arg: vec!["arg".to_owned()],
+                    timeout: Duration::from_secs(1),
+                    hide_output: true
+                },
+                conf
+            );
+        }
+        #[test]
+        fn read_deafaults() {
+            let conf = confy::load_path("res/empty_config.toml").unwrap();
+            assert_eq!(
+                Config {
+                    program: "program".to_owned(),
+                    arg: vec![],
+                    timeout: Config::default_timeout(),
+                    hide_output: Config::default_hide()
+                },
+                conf
+            );
+        }
     }
 }

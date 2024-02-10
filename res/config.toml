@@ -1,0 +1,4 @@
+program = 'program'
+arg = ['arg']
+timeout = 1000
+hide_output = true
