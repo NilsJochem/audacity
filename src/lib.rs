@@ -29,6 +29,10 @@ const LINE_ENDING: &str = "\n";
 extern "C" {
     fn geteuid() -> u32;
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn get_uid() -> u32 {
+    unsafe { geteuid() }
+}
 
 pub mod data;
 
@@ -349,27 +353,85 @@ impl AudacityApi {
     /// - when Ping returns false
     pub async fn new(timer: Option<Duration>) -> Result<Self, Error> {
         use tokio::net::unix::pipe::OpenOptions;
+        trait Pipe {
+            type PType;
+            const NAME: &'static str;
+            const WAIT: bool;
 
-        let uid = unsafe { geteuid() };
+            fn get_path(uid: u32) -> String;
+            fn try_open(options: &OpenOptions, path: &String) -> Result<Self::PType, IoError>;
+        }
+        struct R;
+        impl Pipe for R {
+            type PType = tokio::net::unix::pipe::Receiver;
+
+            const NAME: &'static str = "reader pipe";
+            const WAIT: bool = false;
+
+            fn get_path(uid: u32) -> String {
+                format!("{}.from.{uid}", AudacityApi::BASE_PATH)
+            }
+            fn try_open(options: &OpenOptions, path: &String) -> Result<Self::PType, IoError> {
+                options.open_receiver(path)
+            }
+        }
+        struct W;
+        impl Pipe for W {
+            type PType = tokio::net::unix::pipe::Sender;
+
+            const NAME: &'static str = "writer pipe";
+            const WAIT: bool = true;
+
+            fn get_path(uid: u32) -> String {
+                format!("{}.to.{uid}", AudacityApi::BASE_PATH)
+            }
+            fn try_open(options: &OpenOptions, path: &String) -> Result<Self::PType, IoError> {
+                options.open_sender(path)
+            }
+        }
+
+        async fn open_pipe<P: Pipe>(
+            poll_rate: &mut tokio::time::Interval,
+        ) -> Result<P::PType, Error> {
         let options = OpenOptions::new();
-        let mut poll_rate = interval(Duration::from_millis(100));
-        let writer_path = format!("{}.to.{uid}", Self::BASE_PATH);
-        let future = async {
+            let path = P::get_path(get_uid());
             loop {
                 poll_rate.tick().await;
-                match options.open_sender(&writer_path) {
-                    Ok(writer) => break writer,
+                match P::try_open(&options, &path) {
+                    Ok(pipe) => break Ok(pipe),
+                    Err(err)
+                        if err.raw_os_error() == Some(6)
+                            || err.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        //  - err = Os(6) => pipe is not connected
+                        //  - kind = NotFound => pipe doesn't exist
+                        if P::WAIT {
+                            trace!("no {} found/connected, keep waiting", P::NAME);
+                        } else {
+                            break Err(Error::PipeBroken(
+                                format!("no {} found/connected and will not wait", P::NAME),
+                                Some(err),
+                            ));
+                        }
+                    }
                     Err(err) => {
-                        debug!("{}", Error::PipeBroken("open writer".to_owned(), Some(err)));
+                        let msg = if err.kind() == std::io::ErrorKind::InvalidInput {
+                            format!("expected {} file", P::NAME)
+                        } else {
+                            format!("failed to open {}", P::NAME)
+                        };
+                        break Err(Error::PipeBroken(msg, Some(err)));
                     }
                 }
-                trace!("waiting for audacity to start");
             }
-        };
-        let writer = Self::maybe_timeout(timer, future).await?;
-        let reader = options
-            .open_receiver(format!("{}.from.{uid}", Self::BASE_PATH))
-            .map_err(|err| Error::PipeBroken("open reader".to_owned(), Some(err)))?;
+        }
+
+        let mut poll_rate = interval(Duration::from_millis(100));
+
+        let writer = Self::maybe_timeout(timer, open_pipe::<W>(&mut poll_rate)).await??;
+        poll_rate.reset();
+        let reader = open_pipe::<R>(&mut poll_rate).await?;
+
         debug!("pipes found");
         poll_rate.reset();
         Self::with_pipes(reader, writer, timer, poll_rate).await
