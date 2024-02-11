@@ -121,7 +121,7 @@ impl TrackHint {
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("{0}")]
+    #[error("{0}. Err: {1:?}")]
     PipeBroken(String, #[source] Option<IoError>),
     #[error("Didn't finish with OK or Failed!, {0:?}")]
     MissingOK(String),
