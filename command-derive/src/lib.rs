@@ -18,6 +18,7 @@ struct FOpts {
     display_with: Option<syn::Expr>,
     defaults: Option<syn::Expr>,
     defaults_str: Option<syn::Lit>,
+    ignore: Option<()>,
 }
 
 #[proc_macro_derive(Command, attributes(command))]
@@ -79,6 +80,9 @@ fn match_enum_variant(variant: &syn::Variant) -> TokenStream2 {
 
 fn match_field(field: &syn::Field) -> TokenStream2 {
     let opts = FOpts::from_field(field).expect("wrong Options");
+    if let Some(()) = opts.ignore {
+        return quote!();
+    }
     let ident = field.ident.as_ref().expect("no Tuple structs");
     let name = opts.name.unwrap_or_else(|| {
         CapitalizedString::new_into(ident.to_string().as_ref(), Case::Pascal)
