@@ -45,7 +45,7 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     };
 
     quote! {
-        impl #generics Command for #ident #generics {
+        impl #generics CommandString for #ident #generics {
             fn to_string(&self) -> String {
                 #match_variants
             }

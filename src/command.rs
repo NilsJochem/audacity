@@ -3,7 +3,7 @@ use std::{path::Path, time::Duration};
 pub use NoOut::*;
 pub use Out::*;
 
-pub trait Command {
+trait CommandString {
     fn to_string(&self) -> String;
 }
 #[allow(clippy::needless_pass_by_value)]
@@ -17,11 +17,30 @@ fn push(s: &mut impl std::fmt::Write, cmd: impl AsRef<str>, value: impl ToString
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, derive_more::From)]
+pub enum Any<'a> {
+    Out(Out<'a>),
+    NoOut(NoOut<'a>),
+}
+impl<'a> Any<'a> {
+    pub fn to_string(&self) -> String {
+        match self {
+            Self::Out(it) => it.to_string(),
+            Self::NoOut(it) => it.to_string(),
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, command_derive::Command)]
 pub enum Out<'a> {
     /// Used in testing. Sends the Text string back to you.
-    Message { text: &'a str },
+    Message {
+        text: &'a str,
+        #[command(ignore)]
+        #[allow(unused_variables)]
+        _hide_output: bool,
+    },
     /// Gets information in a list in one of three formats.
     GetInfo {
         #[command(name = "Type", defaults = InfoType::Commands)]
@@ -328,14 +347,16 @@ mod tests {
         assert_eq!(
             "Message: Text=\"text with spaces\"",
             Message {
-                text: "text with spaces"
+                text: "text with spaces",
+                _hide_output: false
             }
             .to_string()
         );
         assert_eq!(
             "Message: Text=text_without_spaces",
             Message {
-                text: "text_without_spaces"
+                text: "text_without_spaces",
+                _hide_output: false
             }
             .to_string()
         );

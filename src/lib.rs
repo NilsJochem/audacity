@@ -213,7 +213,7 @@ impl Config {
         timeout: impl Into<Option<Duration>>,
         hide_output: impl Into<Option<bool>>,
     ) -> Self
-where
+    where
         Iter: IntoIterator,
         Iter::Item: AsRef<str>,
     {
@@ -226,7 +226,7 @@ where
             timeout: timeout.into().unwrap_or(Self::default_timeout()),
             hide_output: hide_output.into().unwrap_or(Self::default_hide()),
         }
-}
+    }
 
     const fn default_timeout() -> Duration {
         Duration::from_millis(500)
@@ -393,7 +393,7 @@ impl AudacityApi {
         async fn open_pipe<P: Pipe>(
             poll_rate: &mut tokio::time::Interval,
         ) -> Result<P::PType, Error> {
-        let options = OpenOptions::new();
+            let options = OpenOptions::new();
             let path = P::get_path(get_uid());
             loop {
                 poll_rate.tick().await;
@@ -456,8 +456,14 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
             timer,
         };
         // waiting for audacity to be ready
-        while !audacity_api.ping().await? {
+        let mut count = 0;
+        while !audacity_api.inner_ping(count > 0).await? {
             poll_rate.tick().await;
+            if count > 0 && log::log_enabled!(log::Level::Debug) {
+                print!(".");
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            }
+            count += 1;
         }
         Ok(audacity_api)
     }
@@ -472,12 +478,12 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     /// # Panics
     /// when a non empty result is recieved
     pub async fn write_assume_empty(&mut self, command: command::NoOut<'_>) -> Result<(), Error> {
-        let result = self.write_any(command.clone(), false).await?;
+        let result = self.write_any(command.clone().into(), false).await?;
         assert_eq!(result, "", "expecting empty result for {command:?}");
         Ok(())
     }
     async fn write_assume_result(&mut self, command: command::Out<'_>) -> Result<String, Error> {
-        self.write_any(command, false).await
+        self.write_any(command.into(), false).await
     }
     /// writes `command` to audacity and waits for a result.
     ///
@@ -489,13 +495,22 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     /// this errors when either `self.write` or `self.read` errors, or the timeout occures
     async fn write_any(
         &mut self,
-        command: impl command::Command + Debug + Send + Sync,
+        command: command::Any<'_>,
         allow_no_ok: bool,
     ) -> Result<String, Error> {
         let timer = self.timer;
         let future = async {
             let command_str = command.to_string().replace('\n', LINE_ENDING);
-            debug!("writing {command_str:?} to audacity");
+            match command {
+                command::Any::Out(command::Message {
+                    text: _,
+                    _hide_output: true,
+                }) => {}
+                _ => {
+                    debug!("writing {command_str:?} to audacity");
+                }
+            }
+
             self.write_pipe
                 .write_all(format!("{command_str}{LINE_ENDING}").as_bytes())
                 .await
@@ -590,8 +605,18 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     ///  - when write/send errors
     ///  - [`Error::MalformedResult`] when something other then ping is answered
     pub async fn ping(&mut self) -> Result<bool, Error> {
+        self.inner_ping(false).await
+    }
+    async fn inner_ping(&mut self, hide_output: bool) -> Result<bool, Error> {
         let result = self
-            .write_any(command::Message { text: "ping" }, true)
+            .write_any(
+                command::Message {
+                    text: "ping",
+                    _hide_output: hide_output,
+                }
+                .into(),
+                true,
+            )
             .await?;
 
         match result.as_str() {
