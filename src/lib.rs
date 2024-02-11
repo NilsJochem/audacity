@@ -167,28 +167,6 @@ impl LaunchError {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Config {
-    pub program: String,
-    // TODO maybe change to list of args
-    #[serde(default = "Vec::new")]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub arg: Vec<String>,
-    /// the length of time until the process is assumed to not be a launcher. The Programm will no longer wait for an exit code.
-    #[serde(
-        default = "Config::default_timeout",
-        skip_serializing_if = "Config::is_default_timeout",
-        deserialize_with = "from_millis",
-        serialize_with = "as_millis"
-    )]
-    pub timeout: Duration,
-    #[serde(
-        default = "Config::default_hide",
-        skip_serializing_if = "Config::is_default_hide"
-    )]
-    pub hide_output: bool,
-}
-
 fn as_millis<S>(d: &Duration, ser: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -199,53 +177,55 @@ fn from_millis<'de, D>(ser: D) -> Result<Duration, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    ser.deserialize_u64(DurationVisitor)
+    use serde::de::Deserialize;
+    u64::deserialize(ser).map(Duration::from_millis)
 }
-struct DurationVisitor;
-impl<'de> serde::de::Visitor<'de> for DurationVisitor {
-    type Value = Duration;
 
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("the duration in milliseconds")
-    }
-    fn visit_u8<E>(self, v: u8) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_u64(v as u64)
-    }
-    fn visit_u16<E>(self, v: u16) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_u64(v as u64)
-    }
-    fn visit_u32<E>(self, v: u32) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_u64(v as u64)
-    }
-    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        u64::try_from(v)
-            .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &"only positiv values"))
-            .and_then(|v| self.visit_u64(v))
-    }
-    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(Duration::from_millis(v))
-    }
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Config {
+    program: String,
+    #[serde(default = "Vec::new")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    arg: Vec<String>,
+    /// the length of time until the process is assumed to not be a launcher. The Programm will no longer wait for an exit code.
+    #[serde(
+        default = "Config::default_timeout",
+        skip_serializing_if = "Config::is_default_timeout",
+        deserialize_with = "from_millis",
+        serialize_with = "as_millis"
+    )]
+    timeout: Duration,
+    #[serde(
+        default = "Config::default_hide",
+        skip_serializing_if = "Config::is_default_hide"
+    )]
+    hide_output: bool,
 }
 
 impl Config {
-    const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
+    pub fn new<Iter>(
+        prog: impl AsRef<str>,
+        args: Iter,
+        timeout: impl Into<Option<Duration>>,
+        hide_output: impl Into<Option<bool>>,
+    ) -> Self
+where
+        Iter: IntoIterator,
+        Iter::Item: AsRef<str>,
+    {
+        Self {
+            program: prog.as_ref().to_owned(),
+            arg: args
+                .into_iter()
+                .map(|it| it.as_ref().to_owned())
+                .collect_vec(),
+            timeout: timeout.into().unwrap_or(Self::default_timeout()),
+            hide_output: hide_output.into().unwrap_or(Self::default_hide()),
+        }
+}
+
     const fn default_timeout() -> Duration {
-        Self::DEFAULT_TIMEOUT
+        Duration::from_millis(500)
     }
     fn is_default_timeout(it: &Duration) -> bool {
         (*it).is_near_to(Self::default_timeout(), Duration::from_millis(1))
@@ -254,18 +234,13 @@ impl Config {
     const fn default_hide() -> bool {
         false
     }
-    fn is_default_hide(it: &bool) -> bool {
+    const fn is_default_hide(it: &bool) -> bool {
         *it == Self::default_hide()
     }
 }
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            program: "gtk4-launch".to_owned(),
-            arg: vec!["audacity".to_owned()],
-            timeout: Self::default_timeout(),
-            hide_output: Self::default_hide(),
-        }
+        Self::new("audacity", None::<&str>, None, None)
     }
 }
 
@@ -354,9 +329,6 @@ impl AudacityApi {
             }
         }
     }
-    fn load_config() -> Result<Config, confy::ConfyError> {
-        confy::load::<Config>("audio-matcher", "audacity")
-    }
 
     /// creates a new Instance of `AudacityApi` for linux.
     ///
@@ -398,7 +370,11 @@ impl AudacityApi {
 
 impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGeneric<W, R> {
     const ACK_START: &'static str = "BatchCommand finished: ";
-    pub(crate) async fn with_pipes(
+    fn load_config() -> Result<Config, confy::ConfyError> {
+        confy::load::<Config>("audio-matcher", "audacity")
+    }
+
+    async fn with_pipes(
         reader: R,
         writer: W,
         timer: Option<Duration>,
@@ -1171,27 +1147,14 @@ mod tests {
         fn read() {
             let conf = confy::load_path("res/config.toml").unwrap();
             assert_eq!(
-                Config {
-                    program: "program".to_owned(),
-                    arg: vec!["arg".to_owned()],
-                    timeout: Duration::from_secs(1),
-                    hide_output: true
-                },
+                Config::new("program", ["arg"], Duration::from_secs(1), true),
                 conf
             );
         }
         #[test]
-        fn read_deafaults() {
+        fn read_defaults() {
             let conf = confy::load_path("res/empty_config.toml").unwrap();
-            assert_eq!(
-                Config {
-                    program: "program".to_owned(),
-                    arg: vec![],
-                    timeout: Config::default_timeout(),
-                    hide_output: Config::default_hide()
-                },
-                conf
-            );
+            assert_eq!(Config::new("program", None::<&str>, None, None), conf);
         }
     }
 }
