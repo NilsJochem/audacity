@@ -260,7 +260,7 @@ pub type AudacityApi = AudacityApiGeneric<
 >;
 #[cfg(windows)]
 impl AudacityApi {
-    pub async fn launch_audacity(config: impl Into<Option<Config>>) -> Result<(), LaunchError> {
+    pub async fn launch(config: impl Into<Option<Config>>) -> Result<(), LaunchError> {
         todo!("stub");
     }
     pub const fn new(timer: Option<Duration>) -> Self {
@@ -309,19 +309,27 @@ impl AudacityApi {
         let mut future = Box::pin(async move {
             let mut command = tokio::process::Command::new(config.program);
             if config.hide_output {
+                // TODO pipe output to logs
+                command.stderr(std::process::Stdio::null());
                 command.stdout(std::process::Stdio::null());
             }
-            for arg in &config.arg {
-                command.arg(arg);
-            }
-            command.kill_on_drop(true);
+            command.args(&config.arg);
+            command.kill_on_drop(false);
+
             LaunchError::from_status_code(command.status().await?.code())
         });
         trace!("waiting for audacity launcher");
         tokio::select! {
             result = &mut future => {
                 trace!("audacity launcher finished");
-                result.map(|()| None)
+                match result {
+                    Ok(()) => Ok(None),
+                    Err(LaunchError::Failed(255)) => {
+                        log::info!("assumes exitcode 255 means another Audacity instance is already running");
+                        Ok(None)
+                    }
+                    Err(err) => Err(err),
+                }
             }
             () = tokio::time::sleep(config.timeout) => {
                 debug!("audacity launcher still running");
