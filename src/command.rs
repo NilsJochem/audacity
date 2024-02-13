@@ -3,17 +3,18 @@ use std::{path::Path, time::Duration};
 pub use NoOut::*;
 pub use Out::*;
 
-trait CommandString {
-    fn to_string(&self) -> String;
-}
 #[allow(clippy::needless_pass_by_value)]
-fn push(s: &mut impl std::fmt::Write, cmd: impl AsRef<str>, value: impl ToString) {
+fn push(
+    s: &mut impl std::fmt::Write,
+    cmd: impl AsRef<str>,
+    value: impl ToString,
+) -> std::fmt::Result {
     let value = value.to_string();
     let cmd = cmd.as_ref();
     if value.contains(' ') {
-        write!(s, " {cmd}=\"{value}\"").expect("failed to build escaped command");
+        write!(s, " {cmd}=\"{value}\"")
     } else {
-        write!(s, " {cmd}={value}").expect("failed to build non-escaped command");
+        write!(s, " {cmd}={value}")
     }
 }
 
@@ -22,11 +23,12 @@ pub enum Any<'a> {
     Out(Out<'a>),
     NoOut(NoOut<'a>),
 }
-impl<'a> ToString for Any<'a> {
-    fn to_string(&self) -> String {
+
+impl<'a> std::fmt::Display for Any<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Out(it) => it.to_string(),
-            Self::NoOut(it) => it.to_string(),
+            Self::Out(it) => write!(f, "{it}"),
+            Self::NoOut(it) => write!(f, "{it}"),
         }
     }
 }

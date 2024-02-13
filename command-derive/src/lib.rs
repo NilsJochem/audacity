@@ -45,8 +45,8 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     };
 
     quote! {
-        impl #generics CommandString for #ident #generics {
-            fn to_string(&self) -> String {
+        impl #generics std::fmt::Display for #ident #generics {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 #match_variants
             }
         }
@@ -65,14 +65,14 @@ fn match_enum_variant(variant: &syn::Variant) -> TokenStream2 {
         .collect::<Option<Vec<_>>>()
         .expect("only support for named structs");
     if fields.is_empty() {
-        quote!(#variant_ident => #variant_name.to_owned(),)
+        quote!(#variant_ident => write!(f, #variant_name),)
     } else {
         let push_fields: TokenStream2 = variant.fields.iter().map(match_field).collect();
         quote! {
             #variant_ident{#(#fields),*} => {
-                let mut s = #variant_name.to_owned();
+                write!(f, #variant_name)?;
                 #push_fields
-                s
+                Ok(())
             },
         }
     }
@@ -91,7 +91,7 @@ fn match_field(field: &syn::Field) -> TokenStream2 {
     });
 
     let ident_map = opts.display_with.map_or(quote!(#ident), |map| quote!(#map));
-    let push = quote!(push(&mut s, #name, #ident_map););
+    let push = quote!(push(f, #name, #ident_map)?;);
 
     let default = match (opts.defaults, opts.defaults_str) {
         (None, None) => None,
