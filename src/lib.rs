@@ -238,6 +238,7 @@ impl Config {
     const fn default_hide() -> bool {
         false
     }
+    #[allow(clippy::trivially_copy_pass_by_ref)] // signature needed by serde
     const fn is_default_hide(it: &bool) -> bool {
         *it == Self::default_hide()
     }
@@ -359,7 +360,7 @@ impl AudacityApi {
             const WAIT: bool;
 
             fn get_path(uid: u32) -> String;
-            fn try_open(options: &OpenOptions, path: &String) -> Result<Self::PType, IoError>;
+            fn try_open(options: &OpenOptions, path: &str) -> Result<Self::PType, IoError>;
         }
         struct R;
         impl Pipe for R {
@@ -371,7 +372,7 @@ impl AudacityApi {
             fn get_path(uid: u32) -> String {
                 format!("{}.from.{uid}", AudacityApi::BASE_PATH)
             }
-            fn try_open(options: &OpenOptions, path: &String) -> Result<Self::PType, IoError> {
+            fn try_open(options: &OpenOptions, path: &str) -> Result<Self::PType, IoError> {
                 options.open_receiver(path)
             }
         }
@@ -385,7 +386,7 @@ impl AudacityApi {
             fn get_path(uid: u32) -> String {
                 format!("{}.to.{uid}", AudacityApi::BASE_PATH)
             }
-            fn try_open(options: &OpenOptions, path: &String) -> Result<Self::PType, IoError> {
+            fn try_open(options: &OpenOptions, path: &str) -> Result<Self::PType, IoError> {
                 options.open_sender(path)
             }
         }
@@ -1078,12 +1079,12 @@ mod tests {
                     "{msg}\n{}Failed!\n\n",
                     AudacityApiGeneric::<Mock, Mock>::ACK_START
                 )
-                .replace("\n", line_ending),
+                .replace('\n', line_ending),
                 ReadMsg::Ok(msg) => format!(
                     "{msg}\n{}OK\n\n",
                     AudacityApiGeneric::<Mock, Mock>::ACK_START
                 )
-                .replace("\n", line_ending),
+                .replace('\n', line_ending),
             }
         }
     }
@@ -1095,17 +1096,17 @@ mod tests {
         #[allow(non_upper_case_globals)]
         const ReadEmpty: Self = Self::Read(ReadMsg::Empty);
         #[allow(non_snake_case)]
-        fn ReadOk(msg: &'a str) -> Self {
+        const fn ReadOk(msg: &'a str) -> Self {
             Self::Read(ReadMsg::Ok(msg))
         }
         #[allow(non_snake_case)]
-        fn ReadFail(msg: &'a str) -> Self {
+        const fn ReadFail(msg: &'a str) -> Self {
             Self::Read(ReadMsg::Fail(msg))
         }
     }
 
     async fn new_mocked_api(
-        actions: impl Iterator<Item = ExpectAction<'_>>,
+        actions: impl Iterator<Item = ExpectAction<'_>> + Send,
         windows_line_ending: bool,
     ) -> AudacityApiGeneric<WriteHalf<Mock>, ReadHalf<Mock>> {
         let line_ending = if windows_line_ending { "\r\n" } else { "\n" };
@@ -1122,7 +1123,7 @@ mod tests {
             match action {
                 ExpectAction::Read(msg) => builder.read(msg.to_string(line_ending).as_bytes()),
                 ExpectAction::Write(msg) => {
-                    builder.write(msg.replace("\n", LINE_ENDING).as_bytes())
+                    builder.write(msg.replace('\n', LINE_ENDING).as_bytes())
                 }
             };
         }
@@ -1147,14 +1148,14 @@ mod tests {
     }
     #[allow(dead_code)]
     impl ReadHandle {
-        fn expect(&mut self, msg: ReadMsg) {
+        fn expect(&mut self, msg: &ReadMsg) {
             self.handle.read(msg.to_string("\n").as_bytes());
         }
         fn expect_ok(&mut self, msg: &str) {
-            self.expect(ReadMsg::Ok(msg));
+            self.expect(&ReadMsg::Ok(msg));
         }
         fn expect_fail(&mut self, msg: &str) {
-            self.expect(ReadMsg::Fail(msg));
+            self.expect(&ReadMsg::Fail(msg));
         }
     }
 
@@ -1203,13 +1204,13 @@ mod tests {
     #[tokio::test]
     async fn read_mulitline_ok() {
         let msg = "some multiline\n Message".to_owned();
-        let mut api = new_mocked_api([ExpectAction::ReadOk(&msg)].into_iter(), false).await;
+        let mut api = new_mocked_api(std::iter::once(ExpectAction::ReadOk(&msg)), false).await;
         assert_eq!(msg, api.read(false).await.unwrap());
     }
     #[tokio::test]
     async fn read_mulitline_failed() {
         let msg = "some multiline\n Message".to_owned();
-        let mut api = new_mocked_api([ExpectAction::ReadFail(&msg)].into_iter(), false).await;
+        let mut api = new_mocked_api(std::iter::once(ExpectAction::ReadFail(&msg)), false).await;
 
         assert!(matches!(
             api.read(false).await.unwrap_err(),
@@ -1219,13 +1220,13 @@ mod tests {
     #[tokio::test]
     async fn read_mulitline_ok_windows_line_ending() {
         let msg = "some multiline\n Message".to_owned();
-        let mut api = new_mocked_api([ExpectAction::ReadOk(&msg)].into_iter(), true).await;
+        let mut api = new_mocked_api(std::iter::once(ExpectAction::ReadOk(&msg)), true).await;
         assert_eq!(msg, api.read(false).await.unwrap());
     }
     #[tokio::test]
     async fn read_mulitline_failed_windows_line_ending() {
         let msg = "some multiline\n Message".to_owned();
-        let mut api = new_mocked_api([ExpectAction::ReadFail(&msg)].into_iter(), true).await;
+        let mut api = new_mocked_api(std::iter::once(ExpectAction::ReadFail(&msg)), true).await;
 
         assert!(matches!(
             api.read(false).await.unwrap_err(),

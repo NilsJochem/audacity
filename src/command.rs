@@ -22,8 +22,8 @@ pub enum Any<'a> {
     Out(Out<'a>),
     NoOut(NoOut<'a>),
 }
-impl<'a> Any<'a> {
-    pub fn to_string(&self) -> String {
+impl<'a> ToString for Any<'a> {
+    fn to_string(&self) -> String {
         match self {
             Self::Out(it) => it.to_string(),
             Self::NoOut(it) => it.to_string(),

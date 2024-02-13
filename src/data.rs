@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(
             "2.3457\t30.0000\ttest name",
             TimeLabel::new(
-                Duration::from_secs_f64(2.3456789),
+                Duration::from_secs_f64(2.345_678_9),
                 Duration::from_secs(30),
                 Some("test name".to_owned()),
             )

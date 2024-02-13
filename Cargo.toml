@@ -30,8 +30,10 @@ aud-v3_3_x = []
 aud-v3_4_x = []
 
 [lints]
-clippy.nursery = "warn"
-clippy.pedantic = "warn"
+# base
+clippy.nursery = { level = "warn", priority = -1 }
+clippy.pedantic = { level = "warn", priority = -1 }
+
 clippy.empty_structs_with_brackets = "warn"
 clippy.format_push_string = "warn"
 clippy.if_then_some_else_none = "warn"
@@ -43,15 +45,17 @@ clippy.semicolon_inside_block = "warn"
 clippy.separated_literal_suffix = "warn"
 clippy.str_to_string = "warn"
 clippy.string_to_string = "warn"
+rust.unsafe_op_in_unsafe_fn = "warn"
+# rust.missing_docs = "warn"
 
 clippy.cast_possible_truncation = "allow"
 clippy.cast_precision_loss = "allow"
 clippy.cast_lossless = "allow"
 clippy.cast_sign_loss = "allow"
-# clippy.missing_errors_doc = "allow"
-# clippy.missing_panics_doc = "allow"
+clippy.return_self_not_must_use = "allow"
 clippy.single_match_else = "allow"
 clippy.option_if_let_else = "allow"
 clippy.must_use_candidate = "allow"
-clippy.too_many_lines = "allow"
 clippy.impl_trait_in_params = "allow"
+
+# custom for this crate

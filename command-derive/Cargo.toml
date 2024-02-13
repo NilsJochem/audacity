@@ -15,3 +15,34 @@ darling = "0.20"
 syn = { version = "2.0", features = ["full"] }
 momo = "0.2"
 common = { git = "ssh://git@github.com/NilsJochem/rust-common" }
+
+[lints]
+# base
+clippy.nursery = { level = "warn", priority = -1 }
+clippy.pedantic = { level = "warn", priority = -1 }
+
+clippy.empty_structs_with_brackets = "warn"
+clippy.format_push_string = "warn"
+clippy.if_then_some_else_none = "warn"
+clippy.missing_assert_message = "warn"
+clippy.multiple_inherent_impl = "warn"
+clippy.non_ascii_literal = "warn"
+clippy.self_named_module_files = "warn"
+clippy.semicolon_inside_block = "warn"
+clippy.separated_literal_suffix = "warn"
+clippy.str_to_string = "warn"
+clippy.string_to_string = "warn"
+rust.unsafe_op_in_unsafe_fn = "warn"
+# rust.missing_docs = "warn"
+
+clippy.cast_possible_truncation = "allow"
+clippy.cast_precision_loss = "allow"
+clippy.cast_lossless = "allow"
+clippy.cast_sign_loss = "allow"
+clippy.return_self_not_must_use = "allow"
+clippy.single_match_else = "allow"
+clippy.option_if_let_else = "allow"
+clippy.must_use_candidate = "allow"
+clippy.impl_trait_in_params = "allow"
+
+# custom for this crate
