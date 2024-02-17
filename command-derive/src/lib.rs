@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024 Nils Jochem
+// SPDX-License-Identifier: MPL-2.0
+
 use darling::{FromField, FromVariant};
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;

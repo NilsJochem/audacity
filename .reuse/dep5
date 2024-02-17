@@ -1,0 +1,14 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: audacity
+Upstream-Contact: Nils Jochem <nilsjochem@gmail.com>
+Source: https://github.com/NilsJochem/audacity
+
+# Sample paragraph, commented out:
+#
+# Files: src/*
+# Copyright: $YEAR $NAME <$CONTACT>
+# License: ...
+
+Files: res/*
+Copyright: 2024 Nils Jochem nilsjochem@gmail.com
+License: CC0-1.0

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024 Nils Jochem
+// SPDX-License-Identifier: MPL-2.0
+
 use data::TimeLabel;
 use itertools::Itertools;
 use log::{debug, error, trace, warn};

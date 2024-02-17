@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024 Nils Jochem
+// SPDX-License-Identifier: MPL-2.0
+
 use std::{path::Path, str::FromStr, time::Duration};
 
 use itertools::Itertools;

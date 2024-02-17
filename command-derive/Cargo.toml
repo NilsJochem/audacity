@@ -1,7 +1,13 @@
+# SPDX-FileCopyrightText: 2024 Nils Jochem
+# SPDX-License-Identifier: MPL-2.0
+
 [package]
 name = "command-derive"
 version = "0.1.1"
 edition = "2021"
+authors = ["Nils Jochem"]
+license = "MPL-2.0"
+repository = "https://github.com/NilsJochem/rust-common"
 
 [lib]
 proc-macro = true
@@ -9,12 +15,11 @@ proc-macro = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+common = { git = "ssh://git@github.com/NilsJochem/rust-common" }
 proc-macro2 = "1.0"
 quote = "1.0"
 darling = "0.20"
 syn = { version = "2.0", features = ["full"] }
-momo = "0.2"
-common = { git = "ssh://git@github.com/NilsJochem/rust-common" }
 
 [lints]
 # base
