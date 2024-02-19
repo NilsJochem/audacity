@@ -1,15 +1,10 @@
 // SPDX-FileCopyrightText: 2024 Nils Jochem
 // SPDX-License-Identifier: MPL-2.0
 
-use data::TimeLabel;
 use itertools::Itertools;
-use log::{debug, error, trace, warn};
+use log::{debug, trace, warn};
 use std::{
-    collections::HashMap,
-    fmt::Debug,
-    io::Error as IoError,
-    marker::Send,
-    path::{Path, PathBuf},
+    collections::HashMap, fmt::Debug, io::Error as IoError, marker::Send, path::Path,
     time::Duration,
 };
 use thiserror::Error;
@@ -20,7 +15,189 @@ use tokio::{
 
 use common::extensions::duration::Ext;
 
+pub use config::Config;
+use data::{timelabel::TimeLabel, LabelHint, RelativeTo, Save, Selection, TrackHint};
+
 pub mod command;
+
+pub mod data {
+    use std::{marker::Send, time::Duration};
+    use tokio::io::{AsyncRead, AsyncWrite};
+
+    use crate::{command, ConnectionError};
+
+    pub mod timelabel;
+    pub use timelabel::TimeLabel;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+    pub enum RelativeTo {
+        ProjectStart,
+        Project,
+        ProjectEnd,
+        SelectionStart,
+        Selection,
+        SelectionEnd,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Selection {
+        All,
+        Stored,
+        Part {
+            start: Duration,
+            end: Duration,
+            relative_to: RelativeTo,
+        },
+    }
+    impl From<Option<Selection>> for command::NoOut<'_> {
+        fn from(value: Option<Selection>) -> Self {
+            match value {
+                None => command::SelectNone,
+                Some(Selection::All) => command::SelectAll,
+                Some(Selection::Stored) => command::SelRestore,
+                Some(Selection::Part {
+                    start,
+                    end,
+                    relative_to,
+                }) => command::SelectTime {
+                    start: Some(start),
+                    end: Some(end),
+                    relative_to,
+                },
+            }
+        }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Save {
+        Restore,
+        Discard,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LabelHint {
+        Track(TrackHint),
+        LabelNr(usize),
+    }
+    impl From<TrackHint> for LabelHint {
+        fn from(value: TrackHint) -> Self {
+            Self::Track(value)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TrackHint {
+        TrackNr(usize),
+        LabelTrackNr(usize),
+    }
+    impl TrackHint {
+        /// gets the tracknumber if it can be found
+        ///
+        /// # Errors
+        /// relays [`get_track_infos`](AudacityApiGeneric::get_track_info) error
+        pub async fn get_label_track_nr<
+            R: AsyncRead + Send + Unpin,
+            W: AsyncWrite + Send + Unpin,
+        >(
+            self,
+            audacity: &mut super::AudacityApiGeneric<W, R>,
+        ) -> Result<Option<usize>, ConnectionError> {
+            Ok(match self {
+                Self::LabelTrackNr(nr) => audacity
+                    .get_track_info()
+                    .await?
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, it)| it.kind == super::result::Kind::Label)
+                    .nth(nr)
+                    .map(|it| it.0),
+                Self::TrackNr(nr) => Some(nr),
+            })
+        }
+    }
+}
+
+pub mod config {
+    use std::time::Duration;
+
+    use common::extensions::duration::Ext;
+    use itertools::Itertools;
+
+    fn as_millis<S>(d: &Duration, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        ser.serialize_u64(d.as_millis() as u64)
+    }
+    fn from_millis<'de, D>(ser: D) -> Result<Duration, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Deserialize;
+        u64::deserialize(ser).map(Duration::from_millis)
+    }
+
+    #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Config {
+        pub(super) program: String,
+        #[serde(default = "Vec::new")]
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub(super) arg: Vec<String>,
+        /// the length of time until the process is assumed to not be a launcher. The Programm will no longer wait for an exit code.
+        #[serde(
+            default = "Config::default_timeout",
+            skip_serializing_if = "Config::is_default_timeout",
+            deserialize_with = "from_millis",
+            serialize_with = "as_millis"
+        )]
+        pub(super) timeout: Duration,
+        #[serde(
+            default = "Config::default_hide",
+            skip_serializing_if = "Config::is_default_hide"
+        )]
+        pub(super) hide_output: bool,
+    }
+
+    impl Config {
+        pub fn new<Iter>(
+            prog: impl AsRef<str>,
+            args: Iter,
+            timeout: impl Into<Option<Duration>>,
+            hide_output: impl Into<Option<bool>>,
+        ) -> Self
+        where
+            Iter: IntoIterator,
+            Iter::Item: AsRef<str>,
+        {
+            Self {
+                program: prog.as_ref().to_owned(),
+                arg: args
+                    .into_iter()
+                    .map(|it| it.as_ref().to_owned())
+                    .collect_vec(),
+                timeout: timeout.into().unwrap_or(Self::default_timeout()),
+                hide_output: hide_output.into().unwrap_or(Self::default_hide()),
+            }
+        }
+
+        const fn default_timeout() -> Duration {
+            Duration::from_millis(500)
+        }
+        fn is_default_timeout(it: &Duration) -> bool {
+            (*it).is_near_to(Self::default_timeout(), Duration::from_millis(1))
+        }
+
+        const fn default_hide() -> bool {
+            false
+        }
+        #[allow(clippy::trivially_copy_pass_by_ref)] // signature needed by serde
+        const fn is_default_hide(it: &bool) -> bool {
+            *it == Self::default_hide()
+        }
+    }
+    impl Default for Config {
+        fn default() -> Self {
+            Self::new("audacity", None::<&str>, None, None)
+        }
+    }
+}
 
 #[cfg(windows)]
 const LINE_ENDING: &str = "\r\n";
@@ -37,133 +214,52 @@ fn get_uid() -> u32 {
     unsafe { geteuid() }
 }
 
-pub mod data;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
-pub enum RelativeTo {
-    ProjectStart,
-    Project,
-    ProjectEnd,
-    SelectionStart,
-    Selection,
-    SelectionEnd,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Selection {
-    All,
-    Stored,
-    Part {
-        start: Duration,
-        end: Duration,
-        relative_to: RelativeTo,
-    },
-}
-impl From<Option<Selection>> for command::NoOut<'_> {
-    fn from(value: Option<Selection>) -> Self {
-        match value {
-            None => command::SelectNone,
-            Some(Selection::All) => command::SelectAll,
-            Some(Selection::Stored) => command::SelRestore,
-            Some(Selection::Part {
-                start,
-                end,
-                relative_to,
-            }) => command::SelectTime {
-                start: Some(start),
-                end: Some(end),
-                relative_to,
-            },
-        }
-    }
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Save {
-    Restore,
-    Discard,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LabelHint {
-    Track(TrackHint),
-    LabelNr(usize),
-}
-impl From<TrackHint> for LabelHint {
-    fn from(value: TrackHint) -> Self {
-        Self::Track(value)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrackHint {
-    TrackNr(usize),
-    LabelTrackNr(usize),
-}
-impl TrackHint {
-    /// gets the tracknumber
-    ///
-    /// # Errors
-    /// relays [`get_track_infos`](AudacityApiGeneric::get_track_info) error
-    ///
-    /// # Panics
-    /// when no labeltrack is found
-    pub async fn get_label_track_nr<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin>(
-        self,
-        audacity: &mut AudacityApiGeneric<W, R>,
-    ) -> Result<usize, Error> {
-        Ok(match self {
-            Self::LabelTrackNr(nr) => {
-                audacity
-                    .get_track_info()
-                    .await?
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, it)| it.kind == result::Kind::Label)
-                    .nth(nr)
-                    .expect("no labeltrack")
-                    .0
-            }
-            Self::TrackNr(nr) => nr,
-        })
-    }
-}
-
-#[derive(Error, Debug)]
-pub enum Error {
+#[derive(Debug, Error)]
+pub enum ConnectionError {
     #[error("{0}. Err: {1:?}")]
-    PipeBroken(String, #[source] Option<IoError>),
+    PipeBroken(String, #[source] Option<IoError>), // TODO parse possible sources
     #[error("Didn't finish with OK or Failed!, {0:?}")]
     MissingOK(String),
     #[error("Failed with {0:?}")]
     AudacityErr(String), // TODO parse Error
-    #[error("couldn't parse result {0:?} because {1}")]
-    MalformedResult(String, #[source] MalformedCause),
-    #[error("Unkown path {0:?}, {1}")]
-    PathErr(PathBuf, #[source] IoError),
     #[error("timeout after {0:?}")]
     Timeout(Duration),
 }
 
-#[derive(Error, Debug)]
-pub enum MalformedCause {
+#[derive(Debug, Error)]
+pub enum ImportLabelError {
     #[error(transparent)]
-    JSON(#[from] serde_json::Error),
+    Connection(#[from] ConnectionError),
     #[error(transparent)]
-    Own(#[from] result::Error),
-    #[error("ping returned {0:?}")]
-    BadPingResult(String),
-    #[error("missing line break")]
-    MissingLineBreak,
+    Parse(#[from] data::timelabel::LabelReadError),
+}
+#[derive(Debug, Error)]
+pub enum ExportLabelError {
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
+    #[error(transparent)]
+    IO(#[from] IoError),
 }
 
 #[derive(Debug, Error)]
-pub enum LaunchError {
+pub enum ImportAudioError {
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
     #[error(transparent)]
     IO(#[from] IoError),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum LaunchError {
+    #[error("system limit for child processes reached")]
+    ProcessLimitReached,
+    #[error("couldn't find programm {0:?}")]
+    UnkownCommand(String),
     #[error("failed with status code {0}")]
     Failed(i32),
     #[error("process was terminated")]
     Terminated,
 }
-
 impl LaunchError {
     const fn from_status_code(value: Option<i32>) -> Result<(), Self> {
         match value {
@@ -173,85 +269,6 @@ impl LaunchError {
         }
     }
 }
-
-fn as_millis<S>(d: &Duration, ser: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    ser.serialize_u64(d.as_millis() as u64)
-}
-fn from_millis<'de, D>(ser: D) -> Result<Duration, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Deserialize;
-    u64::deserialize(ser).map(Duration::from_millis)
-}
-
-#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Config {
-    program: String,
-    #[serde(default = "Vec::new")]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    arg: Vec<String>,
-    /// the length of time until the process is assumed to not be a launcher. The Programm will no longer wait for an exit code.
-    #[serde(
-        default = "Config::default_timeout",
-        skip_serializing_if = "Config::is_default_timeout",
-        deserialize_with = "from_millis",
-        serialize_with = "as_millis"
-    )]
-    timeout: Duration,
-    #[serde(
-        default = "Config::default_hide",
-        skip_serializing_if = "Config::is_default_hide"
-    )]
-    hide_output: bool,
-}
-
-impl Config {
-    pub fn new<Iter>(
-        prog: impl AsRef<str>,
-        args: Iter,
-        timeout: impl Into<Option<Duration>>,
-        hide_output: impl Into<Option<bool>>,
-    ) -> Self
-    where
-        Iter: IntoIterator,
-        Iter::Item: AsRef<str>,
-    {
-        Self {
-            program: prog.as_ref().to_owned(),
-            arg: args
-                .into_iter()
-                .map(|it| it.as_ref().to_owned())
-                .collect_vec(),
-            timeout: timeout.into().unwrap_or(Self::default_timeout()),
-            hide_output: hide_output.into().unwrap_or(Self::default_hide()),
-        }
-    }
-
-    const fn default_timeout() -> Duration {
-        Duration::from_millis(500)
-    }
-    fn is_default_timeout(it: &Duration) -> bool {
-        (*it).is_near_to(Self::default_timeout(), Duration::from_millis(1))
-    }
-
-    const fn default_hide() -> bool {
-        false
-    }
-    #[allow(clippy::trivially_copy_pass_by_ref)] // signature needed by serde
-    const fn is_default_hide(it: &bool) -> bool {
-        *it == Self::default_hide()
-    }
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self::new("audacity", None::<&str>, None, None)
-    }
-}
-
 #[derive(Debug)]
 #[must_use]
 pub struct AudacityApiGeneric<Writer, Reader> {
@@ -301,10 +318,12 @@ impl AudacityApi {
     /// or aborted to stop the running progress.
     ///
     /// # Panics
-    /// can panic, when loading of config fails.
+    /// - when loading of config fails.
+    /// - when no child process can be spawned with an unkown `IOError`
     ///
     /// # Errors
-    /// - [`LaunchError::IO`] when executing the commant failed
+    /// - [`LaunchError::ProcessLimitReached`] when child process limit is reached
+    /// - [`LaunchError::UnkownCommand`] when path to command could't be found
     /// - [`LaunchError::Failed`] when the launcher exited with an statuscode != 0
     /// - [`LaunchError::Terminated`] when the launcher was terminated by a signal
     #[allow(clippy::redundant_pub_crate)] // lint is triggered inside select!
@@ -315,7 +334,7 @@ impl AudacityApi {
             .into()
             .unwrap_or_else(|| Self::load_config().unwrap());
         let mut future = Box::pin(async move {
-            let mut command = tokio::process::Command::new(config.program);
+            let mut command = tokio::process::Command::new(&config.program);
             if config.hide_output {
                 // TODO pipe output to logs
                 command.stderr(std::process::Stdio::null());
@@ -324,7 +343,21 @@ impl AudacityApi {
             command.args(&config.arg);
             command.kill_on_drop(false);
 
-            LaunchError::from_status_code(command.status().await?.code())
+            LaunchError::from_status_code(
+                command
+                    .status()
+                    .await
+                    .map_err(|err| {
+                        if err.kind() == std::io::ErrorKind::WouldBlock {
+                            LaunchError::ProcessLimitReached
+                        } else if err.raw_os_error() == Some(2) {
+                            LaunchError::UnkownCommand(config.program)
+                        } else {
+                            panic!("handle {err} on launch")
+                        }
+                    })?
+                    .code(),
+            )
         });
         trace!("waiting for audacity launcher");
         tokio::select! {
@@ -353,9 +386,8 @@ impl AudacityApi {
     ///
     /// # Errors
     /// - when a Timeout occures
-    /// - when the other Pipe isn't ready after waiting for the first pipe
     /// - when Ping returns false
-    pub async fn new(timer: Option<Duration>) -> Result<Self, Error> {
+    pub async fn new(timer: Option<Duration>) -> Result<Self, ConnectionError> {
         use tokio::net::unix::pipe::OpenOptions;
         trait Pipe {
             type PType;
@@ -396,7 +428,7 @@ impl AudacityApi {
 
         async fn open_pipe<P: Pipe>(
             poll_rate: &mut tokio::time::Interval,
-        ) -> Result<P::PType, Error> {
+        ) -> Result<P::PType, ConnectionError> {
             let options = OpenOptions::new();
             let path = P::get_path(get_uid());
             loop {
@@ -412,7 +444,7 @@ impl AudacityApi {
                         if P::WAIT {
                             trace!("no {} found/connected, keep waiting", P::NAME);
                         } else {
-                            break Err(Error::PipeBroken(
+                            break Err(ConnectionError::PipeBroken(
                                 format!("no {} found/connected and will not wait", P::NAME),
                                 Some(err),
                             ));
@@ -424,7 +456,7 @@ impl AudacityApi {
                         } else {
                             format!("failed to open {}", P::NAME)
                         };
-                        break Err(Error::PipeBroken(msg, Some(err)));
+                        break Err(ConnectionError::PipeBroken(msg, Some(err)));
                     }
                 }
             }
@@ -453,7 +485,7 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
         writer: W,
         timer: Option<Duration>,
         mut poll_rate: tokio::time::Interval,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ConnectionError> {
         let mut audacity_api = Self {
             write_pipe: writer,
             read_pipe: BufReader::new(reader),
@@ -481,12 +513,21 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     ///
     /// # Panics
     /// when a non empty result is recieved
-    pub async fn write_assume_empty(&mut self, command: command::NoOut<'_>) -> Result<(), Error> {
+    pub async fn write_assume_empty(
+        &mut self,
+        command: command::NoOut<'_>,
+    ) -> Result<(), ConnectionError> {
         let result = self.write_any(command.clone().into(), false).await?;
-        assert_eq!(result, "", "expecting empty result for {command:?}");
+        assert!(
+            result.is_empty(),
+            "expecting empty result for {command:?}, but got {result:?}"
+        );
         Ok(())
     }
-    async fn write_assume_result(&mut self, command: command::Out<'_>) -> Result<String, Error> {
+    async fn write_assume_result(
+        &mut self,
+        command: command::Out<'_>,
+    ) -> Result<String, ConnectionError> {
         self.write_any(command.into(), false).await
     }
     /// writes `command` to audacity and waits for a result.
@@ -501,7 +542,7 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
         &mut self,
         command: command::Any<'_>,
         allow_no_ok: bool,
-    ) -> Result<String, Error> {
+    ) -> Result<String, ConnectionError> {
         let timer = self.timer;
         let future = async {
             let command_str = command.to_string().replace('\n', LINE_ENDING);
@@ -519,7 +560,7 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
                 .write_all(format!("{command_str}{LINE_ENDING}").as_bytes())
                 .await
                 .map_err(|err| {
-                    Error::PipeBroken(format!("failed to send {command:?}"), Some(err))
+                    ConnectionError::PipeBroken(format!("failed to send {command:?}"), Some(err))
                 })?;
 
             self.read(allow_no_ok).await
@@ -537,59 +578,62 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     ///  - [`Error::AudacityErr`] when it recieved an "Failed!", the error will contain the Error message
     ///
     /// # Panics
-    /// This can panic, when after {[`Self::ACK_START`]} somthing unexpected appears
-    async fn read(&mut self, allow_empty: bool) -> Result<String, Error> {
+    /// This can panic, when after {[`Self::ACK_START`]} neither Ok nor Failed is recieved
+    async fn read(&mut self, allow_empty: bool) -> Result<String, ConnectionError> {
         let mut result = Vec::new();
         loop {
             if !allow_empty {
                 trace!("reading next line from audacity");
             }
             let line = match read_line(&mut self.read_pipe).await {
-                Ok(Some(line)) => Ok(line),
-                Ok(None) => Err(Error::PipeBroken(
+                Ok(Some(line)) => line,
+                Ok(None) => Err(ConnectionError::PipeBroken(
                     format!("empty reader, current buffer: {:?}", result.join("\n")),
                     None,
-                )),
-                Err(err) => Err(Error::PipeBroken(
+                ))?,
+                Err(err) => Err(ConnectionError::PipeBroken(
                     format!(
                         "failed to read next line, current buffer: {:?}",
                         result.join("\n")
                     ),
                     Some(err),
-                )),
-            }?;
+                ))?,
+            };
 
             if !allow_empty {
                 trace!("read line {line:?} from audacity");
             }
 
-            if line.is_empty() {
-                if allow_empty || !result.is_empty() {
-                    break;
-                }
-                // skipping empty leading line
-            } else {
+            if !line.is_empty() {
                 result.push(line);
+                continue;
             }
+            if allow_empty {
+                return Ok(String::new()); // return empty result early
+            }
+            if !result.is_empty() {
+                break; // return after reading empty line
+            }
+            log::warn!("skipping leading empty line");
         }
-        let Some(last) = result.pop() else {
-            return Ok(String::new());
-        };
-        let result = result.join("\n");
+        let last = result.pop().unwrap();
+        let result_str = || result.join("\n");
         match last.strip_prefix(Self::ACK_START) {
             Some("OK") => {
+                let result = result_str();
                 debug!("read '{result}' from audacity");
                 Ok(result)
             }
-            Some("Failed!") => Err(Error::AudacityErr(result)),
+            Some("Failed!") => Err(ConnectionError::AudacityErr(result_str())),
             Some(x) => panic!("need error handling for {x}"),
             None => {
                 let result = if result.is_empty() {
                     last
                 } else {
-                    format!("{result}\n{last}")
+                    format!("{}\n{last}", result_str())
                 };
-                Err(Error::MissingOK(result))
+                // TODO maybe panic, this should probably considered a bug in Audacity
+                Err(ConnectionError::MissingOK(result))
             }
         }
     }
@@ -598,20 +642,21 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     async fn maybe_timeout<F: std::future::Future + Send>(
         timer: Option<Duration>,
         future: F,
-    ) -> Result<F::Output, Error> {
+    ) -> Result<F::Output, ConnectionError> {
         maybe_timeout(timer, future)
             .await
-            .map_err(|_err| Error::Timeout(timer.unwrap()))
+            .map_err(|_err| ConnectionError::Timeout(timer.unwrap()))
     }
     /// Pings Audacity and returns if the result is correct.
     ///
     /// # Errors
     ///  - when write/send errors
-    ///  - [`Error::MalformedResult`] when something other then ping is answered
-    pub async fn ping(&mut self) -> Result<bool, Error> {
+    pub async fn ping(&mut self) -> Result<bool, ConnectionError> {
         self.inner_ping(false).await
     }
-    async fn inner_ping(&mut self, hide_output: bool) -> Result<bool, Error> {
+    /// # Panics
+    /// when something other than "ping" or "" is recieved
+    async fn inner_ping(&mut self, hide_output: bool) -> Result<bool, ConnectionError> {
         let result = self
             .write_any(
                 command::Message {
@@ -626,10 +671,7 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
         match result.as_str() {
             "ping" => Ok(true),
             "" => Ok(false),
-            _ => Err(Error::MalformedResult(
-                result.clone(),
-                MalformedCause::BadPingResult(result),
-            )),
+            _ => panic!("Audacity answered Message with {result:?} when expecting \"ping\""),
         }
     }
 
@@ -638,15 +680,18 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     /// # Errors
     ///  - when write/send errors
     ///  - [`Error::MalformedResult`] when the result can't be parsed
-    pub async fn get_track_info(&mut self) -> Result<Vec<result::TrackInfo>, Error> {
+    ///
+    /// # Panics
+    ///  - when the recieced track info can't be parsed
+    pub async fn get_track_info(&mut self) -> Result<Vec<result::TrackInfo>, ConnectionError> {
         let json = self
             .write_assume_result(command::GetInfo {
                 type_info: command::InfoType::Tracks,
                 format: command::OutputFormat::Json,
             })
             .await?;
-        serde_json::from_str::<Vec<result::TrackInfo>>(&json)
-            .map_err(|e| Error::MalformedResult(json, e.into()))
+        Ok(serde_json::from_str::<Vec<result::TrackInfo>>(&json)
+            .unwrap_or_else(|err| panic!("failed to read track info from {json:?} because {err}")))
     }
     /// Selects the tracks with position `tracks`.
     ///
@@ -659,7 +704,7 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     pub async fn select_tracks(
         &mut self,
         mut tracks: impl Iterator<Item = usize> + Send,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ConnectionError> {
         self.write_assume_empty(command::SelectTracks {
             mode: command::SelectMode::Set,
             track: tracks.next().unwrap(),
@@ -683,22 +728,28 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     /// # Errors
     ///  - when write/send errors
     ///  - [`Error::AudacityErr`] when path is not a valid audio file (probably)
-    pub async fn import_audio(&mut self, path: impl AsRef<Path> + Send) -> Result<(), Error> {
-        let path = path
-            .as_ref()
-            .canonicalize()
-            .map_err(|e| Error::PathErr(path.as_ref().to_path_buf(), e))?;
+    pub async fn import_audio(
+        &mut self,
+        path: impl AsRef<Path> + Send,
+    ) -> Result<(), ImportAudioError> {
+        let path = path.as_ref().canonicalize()?; // TODO make clear what went wrong
 
-        self.write_assume_empty(command::Import2 { filename: &path })
-            .await
+        Ok(self
+            .write_assume_empty(command::Import2 { filename: &path })
+            .await?)
     }
 
     /// Gets Infos of the lables in the currently open Project.
     ///
     /// # Errors
     ///  - when write/send errors
-    ///  - [`Error::MalformedResult`] when the result can't be parsed
-    pub async fn get_label_info(&mut self) -> Result<HashMap<usize, Vec<TimeLabel>>, Error> {
+    ///
+    /// # Panics
+    ///  - when the recieved data can't be parsed
+    ///  - if audacity sends timelabels with `start` > `end`
+    pub async fn get_label_info(
+        &mut self,
+    ) -> Result<HashMap<usize, Vec<TimeLabel>>, ConnectionError> {
         type RawTimeLabel = (f64, f64, String);
         let json = self
             .write_assume_result(command::GetInfo {
@@ -706,13 +757,15 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
                 format: command::OutputFormat::Json,
             })
             .await?;
-        serde_json::from_str::<'_, Vec<(usize, Vec<RawTimeLabel>)>>(&json)
-            .map_err(|e| Error::MalformedResult(json, e.into()))
-            .map(|list| {
-                list.into_iter()
-                    .map(|(nr, labels)| (nr, labels.into_iter().map_into().collect_vec()))
-                    .collect()
-            })
+        Ok(
+            serde_json::from_str::<'_, Vec<(usize, Vec<RawTimeLabel>)>>(&json)
+                .unwrap_or_else(|err| {
+                    panic!("couldn't parse recieved labels in {json:?} because {err}")
+                })
+                .into_iter()
+                .map(|(nr, labels)| (nr, labels.into_iter().map_into().collect_vec()))
+                .collect(),
+        )
     }
     /// Adds a new label track to the currently open Project.
     ///
@@ -721,7 +774,7 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     pub async fn add_label_track(
         &mut self,
         name: Option<impl AsRef<str> + Send>,
-    ) -> Result<usize, Error> {
+    ) -> Result<usize, ConnectionError> {
         self.write_assume_empty(command::NewLabelTrack).await?;
         if let Some(name) = name {
             let name = Some(name.as_ref());
@@ -741,18 +794,15 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     /// # Errors
     ///  - when write/send errors
     ///  - [`Error::PathErr`] when the file at `path` can't be read
+    #[allow(clippy::missing_panics_doc)]
     pub async fn import_labels_from(
         &mut self,
         path: impl AsRef<Path> + Send + Sync,
         track_name: Option<impl AsRef<str> + Send>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ImportLabelError> {
         let nr = self.add_label_track(track_name).await?;
         let offset = Self::get_label_offset(&self.get_label_info().await?, nr);
-        for (label_nr, label) in TimeLabel::read(&path)
-            .map_err(|err| Error::PathErr(path.as_ref().to_path_buf(), err))?
-            .into_iter()
-            .enumerate()
-        {
+        for (label_nr, label) in TimeLabel::read(&path)?.into_iter().enumerate() {
             let _ = self
                 .add_label(label, Some(LabelHint::LabelNr(offset + label_nr)))
                 .await?;
@@ -771,13 +821,12 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
         &mut self,
         path: impl AsRef<Path> + Send,
         dry_run: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ExportLabelError> {
         TimeLabel::write(
             self.get_label_info().await?.into_values().flatten(),
             &path,
             dry_run,
-        )
-        .map_err(|err| Error::PathErr(path.as_ref().to_path_buf(), err))?;
+        )?;
         Ok(())
     }
     /// Sets the `text`, `start`, `end` of the label at position `i`.
@@ -796,7 +845,7 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
         start: Option<Duration>,
         end: Option<Duration>,
         selected: Option<bool>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ConnectionError> {
         if text.is_none() && start.is_none() && end.is_none() && selected.is_none() {
             warn!("attempted to set_label with no values");
             return Ok(());
@@ -823,7 +872,7 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
         &mut self,
         track_nr: usize,
         label: TimeLabel,
-    ) -> Result<usize, Error> {
+    ) -> Result<usize, ConnectionError> {
         todo!("fix select track");
         self.select_tracks(std::iter::once(track_nr)).await?;
         self.write_assume_empty(command::SetTrackStatus {
@@ -849,39 +898,50 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
         &mut self,
         label: TimeLabel,
         hint: Option<LabelHint>,
-    ) -> Result<usize, Error> {
+    ) -> Result<usize, ConnectionError> {
         self.select(Selection::Part {
-            start: label.start,
-            end: label.end,
+            start: *label.start(),
+            end: *label.end(),
             relative_to: RelativeTo::ProjectStart,
         })
         .await?;
         self.write_assume_empty(command::AddLabel).await?;
 
         let predicate = |(_, candidate): &(usize, &TimeLabel)| {
-            candidate.name.is_none()
+            candidate.name().is_none()
                 && candidate
-                    .start
-                    .is_near_to(label.start, Duration::from_millis(50))
+                    .start()
+                    .is_near_to(*label.start(), Duration::from_millis(50))
                 && candidate
-                    .end
-                    .is_near_to(label.end, Duration::from_millis(50))
+                    .end()
+                    .is_near_to(*label.end(), Duration::from_millis(50))
         };
         let new_id = match hint {
             Some(LabelHint::LabelNr(nr)) => nr,
             Some(LabelHint::Track(track_hint)) => {
-                let track_nr = track_hint.get_label_track_nr(self).await?;
-                self.find_label_in_track(track_nr, predicate).await?
+                let track_nr = track_hint
+                    .get_label_track_nr(self)
+                    .await?
+                    .expect("no label track found");
+                self.find_label_in_track(track_nr, predicate)
+                    .await?
+                    .unwrap_or_else(|| {
+                        panic!("not enought labels in track {track_nr}, can't find label")
+                    })
             }
             None => {
-                let track_nr = self.get_focused_track().await?;
-                self.find_label_in_track(track_nr, predicate).await?
+                let track_nr = self.get_focused_track().await?.expect("no track focused");
+                self.find_label_in_track(track_nr, predicate)
+                    .await?
+                    .unwrap_or_else(|| {
+                        panic!("not enought labels in track {track_nr}, can't find label")
+                    })
             }
         };
 
         self.set_label(
             new_id,
-            label.name,
+            label.name(),
             None,
             None,
             Some(false), // always drop selected state
@@ -894,16 +954,15 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
         &mut self,
         track_nr: usize,
         predicate: impl (FnMut(&(usize, &TimeLabel)) -> bool) + Send,
-    ) -> Result<usize, Error> {
+    ) -> Result<Option<usize>, ConnectionError> {
         let labels = self.get_label_info().await?;
         let new_labels = labels.get(&track_nr).unwrap();
         let label_nr = new_labels
             .iter()
             .enumerate()
             .find(predicate)
-            .unwrap_or_else(|| panic!("not enought labels in track {track_nr}, can't find label"))
-            .0;
-        Ok(Self::get_label_offset(&labels, track_nr) + label_nr)
+            .map(|it| Self::get_label_offset(&labels, track_nr) + it.0);
+        Ok(label_nr)
     }
     fn get_label_offset(labels: &HashMap<usize, Vec<TimeLabel>>, track_hint: usize) -> usize {
         labels
@@ -913,16 +972,21 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
             .sum()
     }
 
-    async fn get_focused_track(&mut self) -> Result<usize, Error> {
-        Ok(self
+    /// # Panics
+    ///  - when multiple tracks claim to be focused
+    async fn get_focused_track(&mut self) -> Result<Option<usize>, ConnectionError> {
+        let mut filter = self
             .get_track_info()
             .await?
             .into_iter()
             .enumerate()
-            .filter(|(_, t)| t.focused)
-            .exactly_one()
-            .expect("no track focused")
-            .0)
+            .filter(|(_, t)| t.focused);
+        let next = filter.next();
+        assert!(
+            filter.next().is_none(),
+            "Audacity claims, there is more than one track focused"
+        );
+        Ok(next.map(|it| it.0))
     }
 
     /// selects `selection` and zooms to it
@@ -936,7 +1000,7 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
         &mut self,
         selection: Selection,
         restore_selection: impl Into<Option<Save>> + Send,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ConnectionError> {
         let restore_selection = restore_selection.into();
         match restore_selection {
             Some(Save::Restore) => self.write_assume_empty(command::SelSave).await?,
@@ -960,7 +1024,7 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
     pub async fn select(
         &mut self,
         selection: impl Into<Option<Selection>> + Send,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ConnectionError> {
         self.write_assume_empty(selection.into().into()).await
     }
 }
@@ -1217,7 +1281,7 @@ mod tests {
 
         assert!(matches!(
             api.read(false).await.unwrap_err(),
-            Error::AudacityErr(e) if e==msg
+            ConnectionError::AudacityErr(e) if e==msg
         ));
     }
     #[tokio::test]
@@ -1233,7 +1297,7 @@ mod tests {
 
         assert!(matches!(
             api.read(false).await.unwrap_err(),
-            Error::AudacityErr(e) if e==msg
+            ConnectionError::AudacityErr(e) if e==msg
         ));
     }
 
