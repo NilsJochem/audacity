@@ -1126,69 +1126,215 @@ pub mod result {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::IntoFuture, iter, sync::Arc};
+
     use super::*;
 
-    use tokio::io::{sink, ReadHalf, Sink, WriteHalf};
+    use tokio::{
+        io::{sink, AsyncReadExt, DuplexStream, ReadHalf, Sink, WriteHalf},
+        sync::Mutex,
+    };
     use tokio_test::io::{Builder, Mock};
 
-    #[allow(dead_code)]
+    #[derive(Debug, Clone, Copy)]
     enum ReadMsg<'a> {
         Ok(&'a str),
         Fail(&'a str),
         Empty,
     }
     impl<'a> ReadMsg<'a> {
-        fn to_string(&self, line_ending: &str) -> String {
+        fn to_string(&self, new_line: &str) -> String {
             match self {
-                ReadMsg::Empty => line_ending.to_owned(),
-                ReadMsg::Fail(msg) => format!(
-                    "{msg}\n{}Failed!\n\n",
-                    AudacityApiGeneric::<Mock, Mock>::ACK_START
-                )
-                .replace('\n', line_ending),
-                ReadMsg::Ok(msg) => format!(
-                    "{msg}\n{}OK\n\n",
-                    AudacityApiGeneric::<Mock, Mock>::ACK_START
-                )
-                .replace('\n', line_ending),
+                ReadMsg::Empty => new_line.to_owned(),
+                ReadMsg::Ok(msg) => Self::make_answer(msg, "OK", new_line),
+                ReadMsg::Fail(msg) => Self::make_answer(msg, "Failed!", new_line),
             }
         }
+        fn make_answer(msg: &str, batch_ok: &str, new_line: &str) -> String {
+            if msg == "" {
+                format!("{}{batch_ok}\n\n", InnerMock::ACK_START)
+            } else {
+                format!("{msg}\n{}{batch_ok}\n\n", InnerMock::ACK_START)
+            }
+            .replace('\n', new_line)
+        }
     }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ExpectAction2<'a> {
+        recieve: &'a str,
+        answer: ReadMsg<'a>,
+    }
+    #[allow(dead_code)]
+    impl<'a> ExpectAction2<'a> {
+        const fn new(recieve: &'a str, answer: ReadMsg<'a>) -> Self {
+            Self { recieve, answer }
+        }
+        #[allow(non_snake_case)]
+        const fn AnswerEmpty(recieve: &'a str) -> Self {
+            Self::new(recieve, ReadMsg::Empty)
+        }
+        #[allow(non_snake_case)]
+        const fn AnswerOk(recieve: &'a str, msg: &'a str) -> Self {
+            Self::new(recieve, ReadMsg::Ok(msg))
+        }
+        #[allow(non_snake_case)]
+        const fn AnswerFail(recieve: &'a str, msg: &'a str) -> Self {
+            Self::new(recieve, ReadMsg::Fail(msg))
+        }
+    }
+
     enum ExpectAction<'a> {
-        Read(ReadMsg<'a>),
-        Write(&'a str),
+        Answer(ReadMsg<'a>),
+        Recieve(&'a str),
     }
     impl<'a> ExpectAction<'a> {
         #[allow(non_upper_case_globals)]
-        const ReadEmpty: Self = Self::Read(ReadMsg::Empty);
+        const AnswerEmpty: Self = Self::Answer(ReadMsg::Empty);
         #[allow(non_snake_case)]
-        const fn ReadOk(msg: &'a str) -> Self {
-            Self::Read(ReadMsg::Ok(msg))
+        const fn AnswerOk(msg: &'a str) -> Self {
+            Self::Answer(ReadMsg::Ok(msg))
         }
         #[allow(non_snake_case)]
-        const fn ReadFail(msg: &'a str) -> Self {
-            Self::Read(ReadMsg::Fail(msg))
+        const fn AnswerFail(msg: &'a str) -> Self {
+            Self::Answer(ReadMsg::Fail(msg))
+        }
+    }
+
+    type InnerMock = AudacityApiGeneric<WriteHalf<DuplexStream>, ReadHalf<DuplexStream>>;
+    struct MockApi {
+        api: Arc<Mutex<InnerMock>>,
+        handle: MockHandle,
+    }
+    struct MockHandle {
+        handle: DuplexStream,
+        new_line: &'static str,
+    }
+    impl MockHandle {
+        async fn read(&mut self) -> Result<String, IoError> {
+            let mut buf = Vec::new();
+            loop {
+                let sleep_dur = if buf.is_empty() {
+                    Duration::from_millis(100) // wait longer at the start of transmission
+                } else {
+                    Duration::from_millis(5)
+                };
+                tokio::select! {
+                    res = self.handle.read_buf(&mut buf) => {
+                        match res? {
+                            0 => {
+                                println!("nothing to read");
+                                break;
+                            }
+                            _read_bytes => {}
+                        }
+                    }
+                    _ = tokio::time::sleep(sleep_dur) => {
+                        if buf.is_empty() {
+                            panic!("expected to read, but only waited")
+                        }
+                        break; // reader empty
+                    }
+                }
+            }
+
+            Ok(String::from_utf8(buf).unwrap_or_else(|err| {
+                panic!("no valid string was returned, but got {:?}", err.as_bytes())
+            }))
+        }
+        async fn write(&mut self, msg: ReadMsg<'_>) -> Result<(), IoError> {
+            self.handle
+                .write_all(msg.to_string(self.new_line).as_bytes())
+                .await
+        }
+
+        async fn expect(&mut self, expect: ExpectAction2<'_>) -> Result<(), IoError> {
+            assert_eq!(
+                self.read().await?,
+                expect.recieve.replace('\n', LINE_ENDING)
+            );
+            self.write(expect.answer).await
+        }
+    }
+
+    impl MockApi {
+        async fn new(windows_new_line: bool) -> Self {
+            let (api, handle) = tokio::io::duplex(64);
+
+            let mut handle = MockHandle {
+                handle,
+                new_line: if windows_new_line { "\r\n" } else { "\n" },
+            };
+            let api = tokio::spawn(async {
+                let (api_rx, api_tx) = tokio::io::split(api);
+                AudacityApiGeneric::with_pipes(
+                    api_rx,
+                    api_tx,
+                    Some(Duration::from_secs(1)),
+                    tokio::time::interval(Duration::from_millis(100)),
+                )
+                .await
+            });
+
+            handle
+                .expect(ExpectAction2::AnswerEmpty("Message: Text=ping\n"))
+                .await
+                .unwrap_or_else(|_| panic!("failed to answer empty startup ping"));
+            handle
+                .expect(ExpectAction2::AnswerOk("Message: Text=ping\n", "ping"))
+                .await
+                .unwrap_or_else(|_| panic!("failed to answer startup ping"));
+
+            Self {
+                api: Arc::new(Mutex::new(
+                    api.into_future()
+                        .await
+                        .expect("failed to join api")
+                        .unwrap_or_else(|err| panic!("failed to create api with {err:?}")),
+                )),
+                handle,
+            }
+        }
+        async fn test<'a, F, I>(
+            &mut self,
+            do_with_api: impl FnOnce(Arc<Mutex<InnerMock>>) -> F,
+            expect: I,
+        ) -> F::Output
+        where
+            F: std::future::Future + Send + 'static,
+            F::Output: Send,
+            I: IntoIterator<Item = ExpectAction2<'a>>,
+        {
+            let join = tokio::spawn(do_with_api(std::sync::Arc::clone(&self.api)));
+
+            for action in expect {
+                self.handle
+                    .expect(action)
+                    .await
+                    .unwrap_or_else(|_| panic!("failed to do {action:?}"));
+            }
+            join.into_future().await.expect("failed to join")
         }
     }
 
     async fn new_mocked_api(
         actions: impl Iterator<Item = ExpectAction<'_>> + Send,
-        windows_line_ending: bool,
+        windows_new_line: bool,
     ) -> AudacityApiGeneric<WriteHalf<Mock>, ReadHalf<Mock>> {
-        let line_ending = if windows_line_ending { "\r\n" } else { "\n" };
+        let new_line = if windows_new_line { "\r\n" } else { "\n" };
         let mut builder = Builder::new();
         let iter = [
-            ExpectAction::Write("Message: Text=ping\n"), // ping with empty result
-            ExpectAction::ReadEmpty,
-            ExpectAction::Write("Message: Text=ping\n"), // until one ping succeeds
-            ExpectAction::ReadOk("ping"),
+            ExpectAction::Recieve("Message: Text=ping\n"), // ping with empty result
+            ExpectAction::AnswerEmpty,
+            ExpectAction::Recieve("Message: Text=ping\n"), // until one ping succeeds
+            ExpectAction::AnswerOk("ping"),
         ]
         .into_iter()
         .chain(actions);
         for action in iter {
             match action {
-                ExpectAction::Read(msg) => builder.read(msg.to_string(line_ending).as_bytes()),
-                ExpectAction::Write(msg) => {
+                ExpectAction::Answer(msg) => builder.read(msg.to_string(new_line).as_bytes()),
+                ExpectAction::Recieve(msg) => {
                     builder.write(msg.replace('\n', LINE_ENDING).as_bytes())
                 }
             };
@@ -1247,18 +1393,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup() {
+        let _ = new_mocked_api(iter::empty(), false).await;
+        let _ = MockApi::new(false).await;
+    }
+    #[tokio::test]
     async fn extra_ping() {
-        let mut api = new_mocked_api(
-            [
-                ExpectAction::Write("Message: Text=ping\n"),
-                ExpectAction::ReadOk("ping"),
-            ]
-            .into_iter(),
-            false,
-        )
-        .await;
+        let mut api = MockApi::new(false).await;
 
-        api.ping().await.unwrap();
+        assert!(
+            !api.test(
+                |api| async move {
+                    let mut api = api.lock().await;
+                    api.ping().await
+                },
+                [ExpectAction2::AnswerEmpty("Message: Text=ping\n"),],
+            )
+            .await
+            .expect("ping failed"),
+            "ping should not be recieved"
+        );
+        assert!(
+            api.test(
+                |api| async move {
+                    let mut api = api.lock().await;
+                    api.ping().await
+                },
+                [ExpectAction2::AnswerOk("Message: Text=ping\n", "ping"),],
+            )
+            .await
+            .expect("ping failed"),
+            "ping should be recieved"
+        );
     }
     #[tokio::test]
     async fn ping_ignore_write() {
@@ -1270,13 +1436,13 @@ mod tests {
     #[tokio::test]
     async fn read_mulitline_ok() {
         let msg = "some multiline\n Message".to_owned();
-        let mut api = new_mocked_api(std::iter::once(ExpectAction::ReadOk(&msg)), false).await;
+        let mut api = new_mocked_api(std::iter::once(ExpectAction::AnswerOk(&msg)), false).await;
         assert_eq!(msg, api.read(false).await.unwrap());
     }
     #[tokio::test]
     async fn read_mulitline_failed() {
         let msg = "some multiline\n Message".to_owned();
-        let mut api = new_mocked_api(std::iter::once(ExpectAction::ReadFail(&msg)), false).await;
+        let mut api = new_mocked_api(std::iter::once(ExpectAction::AnswerFail(&msg)), false).await;
 
         assert!(matches!(
             api.read(false).await.unwrap_err(),
@@ -1284,15 +1450,15 @@ mod tests {
         ));
     }
     #[tokio::test]
-    async fn read_mulitline_ok_windows_line_ending() {
+    async fn read_mulitline_ok_windows_new_line() {
         let msg = "some multiline\n Message".to_owned();
-        let mut api = new_mocked_api(std::iter::once(ExpectAction::ReadOk(&msg)), true).await;
+        let mut api = new_mocked_api(std::iter::once(ExpectAction::AnswerOk(&msg)), true).await;
         assert_eq!(msg, api.read(false).await.unwrap());
     }
     #[tokio::test]
-    async fn read_mulitline_failed_windows_line_ending() {
+    async fn read_mulitline_failed_windows_new_line() {
         let msg = "some multiline\n Message".to_owned();
-        let mut api = new_mocked_api(std::iter::once(ExpectAction::ReadFail(&msg)), true).await;
+        let mut api = new_mocked_api(std::iter::once(ExpectAction::AnswerFail(&msg)), true).await;
 
         assert!(matches!(
             api.read(false).await.unwrap_err(),
