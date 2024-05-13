@@ -348,6 +348,18 @@ mod tests {
         );
     }
     #[test]
+    fn hide_output() {
+        assert_eq!(
+            "Message: Text=\"text with spaces\"",
+            Message {
+                text: "text with spaces",
+                _hide_output: true
+            }
+            .to_string()
+        );
+    }
+
+    #[test]
     fn escape_spaces() {
         assert_eq!(
             "Message: Text=\"text with spaces\"",
