@@ -551,9 +551,7 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
                     text: _,
                     _hide_output: true,
                 }) => {}
-                _ => {
-                    debug!("writing {command_str:?} to audacity");
-                }
+                _ => debug!("writing {command_str:?} to audacity"),
             }
 
             self.write_pipe
@@ -608,11 +606,12 @@ impl<W: AsyncWrite + Send + Unpin, R: AsyncRead + Send + Unpin> AudacityApiGener
                 result.push(line);
                 continue;
             }
-            if allow_empty {
-                return Ok(String::new()); // return empty result early
-            }
             if !result.is_empty() {
                 break; // return after reading empty line
+            }
+            if allow_empty {
+                println!("read empty");
+                return Ok(String::new()); // return empty result early
             }
             log::warn!("skipping leading empty line");
         }
